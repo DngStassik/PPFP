@@ -22,6 +22,11 @@ public class WorkStealing {
         PARETO
     }
 
+    enum TaskMode {
+        BLACK_HOLE,
+        SLEEP
+    }
+
     interface Shutdownable{
         void shutdown();
     }
@@ -207,8 +212,11 @@ public class WorkStealing {
         return value;
     }
 
-    static Runnable createTask(long difficulty) {
-        return new BlackHoleTask(difficulty);
+    static Runnable createTask(long difficulty, TaskMode mode) {
+        return switch (mode) {
+            case BLACK_HOLE -> new BlackHoleTask(difficulty);
+            case SLEEP -> new SleepTask(difficulty);
+        };
     }
 
     static final class BlackHoleTask implements Runnable {
@@ -223,6 +231,25 @@ public class WorkStealing {
         public void run() {
             result = blackHole(difficulty);
             blackHoleResult = result;
+        }
+    }
+
+    static final class SleepTask implements Runnable {
+        private final long difficulty;
+
+        SleepTask(long difficulty) {
+            this.difficulty = difficulty;
+        }
+
+        @Override
+        public void run() {
+            long sleepNanos = difficulty * 1_000_000L / MEAN_TASK_WORK;
+            try {
+                Thread.sleep(sleepNanos / 1_000_000L, (int) (sleepNanos % 1_000_000L));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Sleep task was interrupted", e);
+            }
         }
     }
 
@@ -242,7 +269,6 @@ public class WorkStealing {
 
     static long[] createTaskWorkloads(TaskDistribution distribution) {
         var random = new Random(RANDOM_SEED);
-        // var random = java.util.concurrent.ThreadLocalRandom.current();
         var workloads = new long[TASK_NUMBER];
 
         long totalWork = 0;
@@ -276,20 +302,21 @@ public class WorkStealing {
         return workloads;
     }
 
-    static Vector<Runnable> createTasks(TaskDistribution distribution){
+    static Vector<Runnable> createTasks(TaskDistribution distribution, TaskMode mode){
         var workloads = createTaskWorkloads(distribution);
         return new Vector<>(
                 IntStream
                     .iterate(0, x -> x < TASK_NUMBER, x -> x + 1)
-                    .mapToObj(x -> createTask(workloads[x]))
+                    .mapToObj(x -> createTask(workloads[x], mode))
                     .toList()
         );
     }
 
     public record Pair<A,B>(A first, B second){};
 
-    public static Pair<Long, Long> measureExecutor(ShutdownableExecutor executor, TaskDistribution distribution){
-        var tasks = createTasks(distribution);
+    public static Pair<Long, Long> measureExecutor(ShutdownableExecutor executor,
+                                                    TaskDistribution distribution, TaskMode mode){
+        var tasks = createTasks(distribution, mode);
         var start = System.nanoTime();
         tasks.forEach(executor::execute);
         var submitionEnd = System.nanoTime();
@@ -301,27 +328,31 @@ public class WorkStealing {
     public static void main(String[] args) {
         System.out.println("Tasks: " + TASK_NUMBER + ", total work: " + TARGET_TOTAL_WORK
                 + ", worker threads: " + THREAD_NUMBER);
+        System.out.println("SLEEP uses 1 ms per " + MEAN_TASK_WORK + " work units.");
 
         for (var distribution : TaskDistribution.values()) {
             System.out.println("Task distribution: " + distribution);
 
-            var threadPerTaskExecutorResult = measureExecutor(new ThreadPerTaskExecutor(), distribution);
-            printResult("Thread per task", threadPerTaskExecutorResult);
-
-            var fixedThreadPoolExecutorResult = measureExecutor(
-                    new FixedThreadPoolExecutor(THREAD_NUMBER), distribution);
-            printResult("Fixed thread pool", fixedThreadPoolExecutorResult);
-
-            var roundRobinExecutorResult = measureExecutor(new RoundRobinExecutor(THREAD_NUMBER), distribution);
-            printResult("Round robin", roundRobinExecutorResult);
-
-            var workStealingExecutorResult = measureExecutor(new WorkStealingExecutor(THREAD_NUMBER), distribution);
-            printResult("Work stealing", workStealingExecutorResult);
+            printComparison("Thread per task", distribution, ThreadPerTaskExecutor::new);
+            printComparison("Fixed thread pool", distribution,
+                    () -> new FixedThreadPoolExecutor(THREAD_NUMBER));
+            printComparison("Round robin", distribution,
+                    () -> new RoundRobinExecutor(THREAD_NUMBER));
+            printComparison("Work stealing", distribution,
+                    () -> new WorkStealingExecutor(THREAD_NUMBER));
         }
     }
 
-    static void printResult(String name, Pair<Long, Long> result) {
-        System.out.printf(Locale.ROOT, "  %-20s submit: %8.3f ms, total: %8.3f ms%n",
-                name, result.first / 1_000_000d, result.second / 1_000_000d);
+    static void printComparison(String name, TaskDistribution distribution,
+                                Supplier<ShutdownableExecutor> executorFactory) {
+        var blackHoleResult = measureExecutor(executorFactory.get(), distribution, TaskMode.BLACK_HOLE);
+        var sleepResult = measureExecutor(executorFactory.get(), distribution, TaskMode.SLEEP);
+        printResult(name, blackHoleResult, sleepResult);
+    }
+
+    static void printResult(String name, Pair<Long, Long> blackHoleResult, Pair<Long, Long> sleepResult) {
+        System.out.printf(Locale.ROOT,
+                "  %-20s blackHole: %8.3f ms, sleep: %8.3f ms%n",
+                name, blackHoleResult.second / 1_000_000d, sleepResult.second / 1_000_000d);
     }
 }
